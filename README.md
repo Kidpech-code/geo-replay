@@ -18,7 +18,7 @@
 ## ข้อมูลไหลอย่างไร
 
 ```mermaid
-flowchart LR
+flowchart TD
     A["ไฟล์ GPX 1.1<br/>พิกัด + เวลา"] --> B["อ่านและตรวจทุกจุด"]
     B --> C{"โหมด"}
     C -->|replay| D["รอตามเวลา GPX<br/>ปรับด้วย -speed"]

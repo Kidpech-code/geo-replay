@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="geo-replay" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Synthetic Bangkok walk</name>
+    <trkseg>
+      <trkpt lat="13.7563" lon="100.5018"><time>2026-10-02T00:00:00Z</time></trkpt>
+      <trkpt lat="13.7565" lon="100.5020"><time>2026-10-02T00:00:05Z</time></trkpt>
+      <trkpt lat="13.7567" lon="100.5022"><time>2026-10-02T00:00:10Z</time></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

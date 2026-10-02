@@ -21,14 +21,20 @@ import (
 )
 
 const (
-	gpxNamespace = "http://www.topografix.com/GPX/1/1"
-	maxGPXBytes  = 32 << 20
+	gpxNamespace  = "http://www.topografix.com/GPX/1/1"
+	maxGPXBytes   = 32 << 20
+	maxReplyBytes = 8 << 20
 )
 
 type pointPayload struct {
 	Latitude  float64   `json:"latitude"`
 	Longitude float64   `json:"longitude"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+type myAPIPoint struct {
+	Lng float64 `json:"lng"`
+	Lat float64 `json:"lat"`
 }
 
 type trackPoint struct {
@@ -70,7 +76,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("geo-replay", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	file := flags.String("file", "", "GPX 1.1 track file (required)")
-	endpoint := flags.String("url", "", "HTTP endpoint for JSON POSTs; omit to preview NDJSON")
+	endpoint := flags.String("url", "", "HTTP endpoint for JSON POSTs; omit to preview JSON")
+	mode := flags.String("mode", "replay", "replay or my-api")
 	speed := flags.Float64("speed", 1, "replay speed multiplier (must be positive)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -84,6 +91,12 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	if *speed <= 0 || math.IsNaN(*speed) || math.IsInf(*speed, 0) {
 		return errors.New("speed must be a positive finite number")
 	}
+	if *mode != "replay" && *mode != "my-api" {
+		return errors.New("mode must be replay or my-api")
+	}
+	if *mode == "my-api" && *speed != 1 {
+		return errors.New("speed is only used in replay mode")
+	}
 	if err := validateURL(*endpoint); err != nil {
 		return err
 	}
@@ -91,22 +104,42 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if *mode == "my-api" {
+		if len(points) > 1000 {
+			return errors.New("my-api accepts at most 1000 points per batch")
+		}
+		batch := make([]myAPIPoint, len(points))
+		for i, point := range points {
+			if point.Latitude < 5 || point.Latitude > 21 || point.Longitude < 97 || point.Longitude > 106 {
+				return fmt.Errorf("point %d: outside my-api Thailand bounds", i+1)
+			}
+			batch[i] = myAPIPoint{Lng: point.Longitude, Lat: point.Latitude}
+		}
+		if *endpoint == "" {
+			return json.NewEncoder(out).Encode(batch)
+		}
+		return postBatch(ctx, newClient(20*time.Second), *endpoint, batch, out)
+	}
 
 	emit := func(_ context.Context, point pointPayload) error {
 		return json.NewEncoder(out).Encode(point)
 	}
 	if *endpoint != "" {
-		client := &http.Client{
-			Timeout: 10 * time.Second,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		client := newClient(10 * time.Second)
 		emit = func(ctx context.Context, point pointPayload) error {
 			return postPoint(ctx, client, *endpoint, point)
 		}
 	}
 	return replay(ctx, points, *speed, emit)
+}
+
+func newClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func validateURL(raw string) error {
@@ -214,28 +247,13 @@ func replay(ctx context.Context, points []trackPoint, speed float64, emit func(c
 }
 
 func postPoint(ctx context.Context, client *http.Client, endpoint string, point pointPayload) error {
-	body, err := json.Marshal(point)
+	body, err := sendJSON(ctx, client, endpoint, point)
 	if err != nil {
-		return fmt.Errorf("encode point: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("send request: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if err := resp.Body.Close(); err != nil {
-			return fmt.Errorf("HTTP %d; close response: %w", resp.StatusCode, err)
-		}
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return err
 	}
 	// ponytail: drain up to 64 KiB; raise the limit if large success bodies need connection reuse.
-	_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	closeErr := resp.Body.Close()
+	_, readErr := io.Copy(io.Discard, io.LimitReader(body, 64<<10))
+	closeErr := body.Close()
 	if readErr != nil {
 		return fmt.Errorf("read response: %w", readErr)
 	}
@@ -243,4 +261,71 @@ func postPoint(ctx context.Context, client *http.Client, endpoint string, point 
 		return fmt.Errorf("close response: %w", closeErr)
 	}
 	return nil
+}
+
+func postBatch(ctx context.Context, client *http.Client, endpoint string, points []myAPIPoint, out io.Writer) error {
+	body, err := sendJSON(ctx, client, endpoint, points)
+	if err != nil {
+		return err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(body, maxReplyBytes+1))
+	closeErr := body.Close()
+	if readErr != nil {
+		return fmt.Errorf("read response: %w", readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close response: %w", closeErr)
+	}
+	if len(data) > maxReplyBytes {
+		return errors.New("my-api response exceeds 8 MiB")
+	}
+	var reply struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			Lng     *float64 `json:"lng"`
+			Lat     *float64 `json:"lat"`
+			Matched *bool    `json:"matched"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return fmt.Errorf("decode my-api response: %w", err)
+	}
+	if !reply.Success || len(reply.Data) != len(points) {
+		return fmt.Errorf("my-api response does not contain %d successful results", len(points))
+	}
+	for i, result := range reply.Data {
+		if result.Lng == nil || result.Lat == nil || result.Matched == nil || *result.Lng != points[i].Lng || *result.Lat != points[i].Lat {
+			return fmt.Errorf("my-api result %d does not match its request point", i+1)
+		}
+	}
+	if _, err := out.Write(data); err != nil {
+		return fmt.Errorf("write response: %w", err)
+	}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		_, err = io.WriteString(out, "\n")
+	}
+	return err
+}
+
+func sendJSON(ctx context.Context, client *http.Client, endpoint string, payload any) (io.ReadCloser, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode JSON: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if err := resp.Body.Close(); err != nil {
+			return nil, fmt.Errorf("HTTP %d; close response: %w", resp.StatusCode, err)
+		}
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp.Body, nil
 }

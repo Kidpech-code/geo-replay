@@ -150,3 +150,111 @@ func TestRunPreviewsNDJSONWithoutURL(t *testing.T) {
 		t.Fatalf("unexpected first line: %q, err=%v", lines[0], err)
 	}
 }
+
+func TestRunMyAPIPreviewsExactBatch(t *testing.T) {
+	var output bytes.Buffer
+	if err := run(context.Background(), []string{"-file", writeGPX(t, sampleGPX), "-mode", "my-api"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"lng":100.5018,"lat":13.7563},{"lng":100.5019,"lat":13.7564}]` + "\n"
+	if output.String() != want {
+		t.Fatalf("payload = %q, want %q", output.String(), want)
+	}
+}
+
+func TestRunMyAPIPostsOneBatchAndReturnsResults(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/api/v1/geo/reverse/batch" || r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("unexpected request: %s %s %s", r.Method, r.URL.Path, r.Header.Get("Content-Type"))
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+		}
+		want := `[{"lng":100.5018,"lat":13.7563},{"lng":100.5019,"lat":13.7564}]`
+		if string(body) != want {
+			t.Errorf("body = %s, want %s", body, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"message":"ok","data":[{"lng":100.5018,"lat":13.7563,"matched":true},{"lng":100.5019,"lat":13.7564,"matched":false}]}`)
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := run(context.Background(), []string{"-file", writeGPX(t, sampleGPX), "-mode", "my-api", "-url", server.URL + "/api/v1/geo/reverse/batch"}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || !strings.Contains(output.String(), `"matched":false`) {
+		t.Fatalf("calls=%d output=%q", calls.Load(), output.String())
+	}
+}
+
+func TestRunMyAPIRejectsInvalidBatchBeforePosting(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name string
+		gpx  string
+	}{
+		{"outside Thailand", strings.Replace(sampleGPX, `lat="13.7564"`, `lat="22"`, 1)},
+		{"too many points", makeGPXPoints(1001)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := run(context.Background(), []string{"-file", writeGPX(t, tc.gpx), "-mode", "my-api", "-url", server.URL}, io.Discard)
+			if err == nil || calls.Load() != 0 {
+				t.Fatalf("want preflight error and zero POSTs, got err=%v calls=%d", err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestRunMyAPIRejectsSpeed(t *testing.T) {
+	err := run(context.Background(), []string{"-file", writeGPX(t, sampleGPX), "-mode", "my-api", "-speed", "60"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "speed") {
+		t.Fatalf("want incompatible speed error, got %v", err)
+	}
+}
+
+func TestRunMyAPIRejectsIncompleteResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"success":true,"data":[{"matched":true}]}`)
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := run(context.Background(), []string{"-file", writeGPX(t, sampleGPX), "-mode", "my-api", "-url", server.URL}, &output)
+	if err == nil || output.Len() != 0 {
+		t.Fatalf("want error and no partial output, got err=%v output=%q", err, output.String())
+	}
+}
+
+func TestRunMyAPIRejectsMalformedResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"success":true,"data":[null,{}]}`)
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := run(context.Background(), []string{"-file", writeGPX(t, sampleGPX), "-mode", "my-api", "-url", server.URL}, &output)
+	if err == nil || output.Len() != 0 {
+		t.Fatalf("want error and no partial output, got err=%v output=%q", err, output.String())
+	}
+}
+
+func makeGPXPoints(n int) string {
+	var gpx strings.Builder
+	gpx.WriteString(`<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1"><trk><trkseg>`)
+	for range n {
+		gpx.WriteString(`<trkpt lat="13.75" lon="100.50"><time>2026-10-02T00:00:00Z</time></trkpt>`)
+	}
+	gpx.WriteString(`</trkseg></trk></gpx>`)
+	return gpx.String()
+}
